@@ -46,6 +46,12 @@ func TestUDPConn(t *testing.T) { // nolint:maintidx,cyclop
 		}{
 			{"idle -> request -> ready", bindingStateIdle, bindingStateRequest, bindingStateReady, false, true},
 			{"idle -> request -> failed", bindingStateIdle, bindingStateRequest, bindingStateFailed, false, false},
+			{"unknown -> request -> ready", bindingStateUnknown, bindingStateRequest, bindingStateReady, false, true},
+			{"ready unknown -> refresh -> ready", bindingStateReadyUnknown, bindingStateRefresh, bindingStateReady, false, true},
+			{
+				"ready unknown -> refresh -> failed",
+				bindingStateReadyUnknown, bindingStateRefresh, bindingStateFailed, false, false,
+			},
 			{"ready (stale) -> refresh -> ready", bindingStateReady, bindingStateRefresh, bindingStateReady, true, true},
 			{"ready (stale) -> refresh -> failed", bindingStateReady, bindingStateRefresh, bindingStateFailed, true, false},
 

@@ -24,6 +24,15 @@ type bindingState int32
 const (
 	bindingStateIdle bindingState = iota
 	bindingStateRequest
+	// bindingStateUnknown means an initial ChannelBind transaction ended
+	// ambiguously (for example the response was lost). The server may or may
+	// not have installed the binding, and a later attempt must be allowed to
+	// find out instead of keeping the peer permanently failed.
+	bindingStateUnknown
+	// bindingStateReadyUnknown means a previously confirmed binding failed to
+	// refresh ambiguously. The saved channel mapping is still assumed usable
+	// while a refresh is attempted again.
+	bindingStateReadyUnknown
 	bindingStateReady
 	bindingStateRefresh
 	bindingStateFailed
@@ -64,7 +73,7 @@ func (b *binding) refreshedAt() time.Time {
 func (b *binding) ok() bool {
 	state := b.state()
 
-	return state == bindingStateReady || state == bindingStateRefresh
+	return state == bindingStateReady || state == bindingStateRefresh || state == bindingStateReadyUnknown
 }
 
 // Thread-safe binding map.
