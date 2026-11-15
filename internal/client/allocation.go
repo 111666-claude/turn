@@ -33,6 +33,10 @@ type AllocationConfig struct {
 	PermissionRefreshInterval time.Duration
 	BindingRefreshInterval    time.Duration
 	BindingCheckInterval      time.Duration
+
+	// MobilityTicket is the RFC 8016 mobility ticket issued by the server in
+	// the Allocate success response, or nil if mobility was not negotiated.
+	MobilityTicket []byte
 }
 
 type allocation struct {
@@ -46,6 +50,7 @@ type allocation struct {
 	realm             stun.Realm            // Read-only
 	_nonce            stun.Nonce            // Needs mutex x
 	_lifetime         time.Duration         // Needs mutex x
+	_mobilityTicket   []byte                // Needs mutex x
 	net               transport.Net         // Thread-safe
 	refreshAllocTimer *PeriodicTimer        // Thread-safe
 	refreshPermsTimer *PeriodicTimer        // Thread-safe
@@ -206,4 +211,18 @@ func (a *allocation) setLifetime(lifetime time.Duration) {
 	defer a.mutex.Unlock()
 
 	a._lifetime = lifetime
+}
+
+func (a *allocation) mobilityTicket() []byte {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+
+	return a._mobilityTicket
+}
+
+func (a *allocation) setMobilityTicket(ticket []byte) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	a._mobilityTicket = ticket
 }

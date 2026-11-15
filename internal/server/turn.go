@@ -108,6 +108,18 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 		return buildAndSendErr(req.Conn, req.SrcAddr, errNoDontFragmentSupport, msg...)
 	}
 
+	// RFC 8016 Section 4.1: the client includes an empty MOBILITY-TICKET
+	// attribute in the Allocate request to indicate that it supports
+	// mobility. A non-empty ticket in an Allocate request is an error.
+	mobilityRequested := false
+	if stunMsg.Contains(proto.AttrMobilityTicket) && req.AllocationManager.MobilityEnabled() {
+		var ticketAttr proto.MobilityTicket
+		if err = ticketAttr.GetFrom(stunMsg); err != nil || len(ticketAttr) != 0 {
+			return buildAndSendErr(req.Conn, req.SrcAddr, allocation.ErrInvalidMobilityTicket, badRequestMsg...)
+		}
+		mobilityRequested = true
+	}
+
 	// 5.  The server checks if the request contains a RESERVATION-TOKEN
 	//     attribute.  If yes, and the request also contains an EVEN-PORT
 	//     attribute, then the server rejects the request with a 400 (Bad
@@ -270,6 +282,18 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 		responseAttrs = append(responseAttrs, proto.ReservationToken([]byte(reservationToken)))
 	}
 
+	// RFC 8016 Section 4.2: if the client requested mobility and the server
+	// supports it, the success response carries a fresh mobility ticket.
+	// Mobility only applies to UDP allocations; a TCP 5-tuple cannot be
+	// migrated this way.
+	if mobilityRequested && requestedTransport.Protocol == proto.ProtoUDP {
+		mobilityTicket, ticketErr := req.AllocationManager.CreateMobilityTicket(alloc, userID)
+		if ticketErr != nil {
+			return buildAndSendErr(req.Conn, req.SrcAddr, ticketErr, insufficientCapacityMsg...)
+		}
+		responseAttrs = append(responseAttrs, proto.MobilityTicket(mobilityTicket))
+	}
+
 	msg := buildMsg(
 		stunMsg.TransactionID,
 		stun.NewType(stun.MethodAllocate, stun.ClassSuccessResponse),
@@ -295,8 +319,34 @@ func handleRefreshRequest(req Request, stunMsg *stun.Message) error {
 		Protocol: allocation.UDP,
 	}
 
+	// RFC 8016 Section 4.1: when the client's 5-tuple changes, it sends an
+	// authenticated Refresh request carrying its mobility ticket.
+	var mobilityTicket proto.MobilityTicket
+	hasMobilityTicket := false
+	if ticketErr := mobilityTicket.GetFrom(stunMsg); ticketErr == nil && len(mobilityTicket) > 0 {
+		hasMobilityTicket = true
+	}
+
 	a := req.AllocationManager.GetAllocationForUserID(fiveTuple, userID) //nolint:varnamelen
-	if a == nil {
+
+	var newMobilityTicket []byte
+	if hasMobilityTicket {
+		// This is a mobility event (or a retransmission of one): validate the
+		// ticket and move the allocation to the new 5-tuple. Any failure
+		// (unknown, expired, replayed, cross-user or tampered ticket) is
+		// rejected with a generic 400 (Bad Request) so that the response does
+		// not reveal anything about other allocations.
+		var migrateErr error
+		a, newMobilityTicket, migrateErr = req.AllocationManager.MigrateAllocation(
+			mobilityTicket, userID, fiveTuple, req.Conn)
+		if migrateErr != nil {
+			return buildAndSendErr(req.Conn, req.SrcAddr, migrateErr, buildMsg(
+				stunMsg.TransactionID,
+				stun.NewType(stun.MethodRefresh, stun.ClassErrorResponse),
+				&stun.ErrorCodeAttribute{Code: stun.CodeBadRequest}, messageIntegrity)...)
+		}
+		req.Log.Debugf("Allocation for user %s migrated to 5-tuple %v", userID, fiveTuple)
+	} else if a == nil {
 		return fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr())
 	}
 
@@ -341,18 +391,25 @@ func handleRefreshRequest(req Request, stunMsg *stun.Message) error {
 		req.AllocationManager.DeleteAllocation(fiveTuple)
 	}
 
+	responseAttrs := []stun.Setter{
+		&proto.Lifetime{
+			Duration: lifetimeDuration,
+		},
+	}
+	// RFC 8016 Section 4.2: a successful mobility Refresh returns a fresh
+	// ticket that supersedes the presented one.
+	if hasMobilityTicket && lifetimeDuration != 0 {
+		responseAttrs = append(responseAttrs, proto.MobilityTicket(newMobilityTicket))
+	}
+	responseAttrs = append(responseAttrs, messageIntegrity)
+
 	return buildAndSend(
 		req.Conn,
 		req.SrcAddr,
 		buildMsg(
 			stunMsg.TransactionID,
 			stun.NewType(stun.MethodRefresh, stun.ClassSuccessResponse),
-			[]stun.Setter{
-				&proto.Lifetime{
-					Duration: lifetimeDuration,
-				},
-				messageIntegrity,
-			}...,
+			responseAttrs...,
 		)...,
 	)
 }

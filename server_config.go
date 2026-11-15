@@ -170,6 +170,14 @@ type ServerConfig struct {
 	// follows the listener address family for browser compatibility.
 	StrictAddressFamily bool
 
+	// MobilityTicketLifetime enables RFC 8016 allocation mobility when
+	// greater than zero and sets how long an issued MOBILITY-TICKET remains
+	// valid. When a client that negotiated mobility re-authenticates from a
+	// new 5-tuple with a valid ticket, its allocation (including permissions
+	// and channel bindings) is migrated instead of being recreated.
+	// Zero (the default) disables mobility.
+	MobilityTicketLifetime time.Duration
+
 	// Sets the server inbound MTU(Maximum transmition unit). Defaults to 1600 bytes.
 	InboundMTU int
 }

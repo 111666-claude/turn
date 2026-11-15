@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/logging"
@@ -58,6 +59,13 @@ type ClientConfig struct {
 	// local address, falling back to IPv4 if inference fails. See RFC 6156.
 	RequestedAddressFamily RequestedAddressFamily
 
+	// Mobility enables RFC 8016 allocation mobility for UDP allocations. The
+	// client requests a MOBILITY-TICKET during Allocate; if the server
+	// provides one, MigrateAllocation can later move the allocation to a new
+	// 5-tuple (e.g. after a Wi-Fi to cellular network switch) without
+	// losing permissions and channel bindings.
+	Mobility bool
+
 	evenPort               bool   // If EVEN-PORT Attribute should be sent in Allocation
 	reservationToken       []byte // If Server responds with RESERVATION-TOKEN or if Client wishes to send one
 	bindingRefreshInterval time.Duration
@@ -82,6 +90,7 @@ type Client struct {
 	tcpAllocation *client.TCPAllocation  // Protected by mutex ***
 	allocTryLock  client.TryLock         // Thread-safe
 	listenTryLock client.TryLock         // Thread-safe
+	listenDesired atomic.Bool            // Thread-safe
 	mutex         sync.RWMutex           // Thread-safe
 	mutexTrMap    sync.Mutex             // Thread-safe
 	log           logging.LeveledLogger  // Read-only
@@ -94,6 +103,13 @@ type Client struct {
 
 	// REQUESTED-ADDRESS-FAMILY attribute for allocations (RFC 6156)
 	requestedAddressFamily proto.RequestedAddressFamily
+
+	// mobility indicates the client requests an RFC 8016 mobility ticket
+	mobility bool
+
+	// migratedConn is the connection adopted by a successful MigrateAllocation
+	// call (RFC 8016). When nil, conn is used. Protected by mutex.
+	migratedConn net.PacketConn
 
 	permissionRefreshInterval time.Duration
 	bindingRefreshInterval    time.Duration
@@ -248,6 +264,7 @@ func NewClient(config *ClientConfig) (*Client, error) { //nolint:gocyclo,cyclop
 		evenPort:                  config.evenPort,
 		reservationToken:          config.reservationToken,
 		requestedAddressFamily:    requestedAddressFamily,
+		mobility:                  config.Mobility,
 		permissionRefreshInterval: config.PermissionRefreshInterval,
 		bindingRefreshInterval:    config.bindingRefreshInterval,
 		bindingCheckInterval:      config.bindingCheckInterval,
@@ -278,7 +295,21 @@ func (c *Client) Realm() stun.Realm {
 
 // WriteTo sends data to the specified destination using the base socket.
 func (c *Client) WriteTo(data []byte, to net.Addr) (int, error) {
-	return c.conn.WriteTo(data, to)
+	return c.activeConn().WriteTo(data, to)
+}
+
+// activeConn returns the socket currently used for client traffic: the
+// connection adopted by the latest successful MigrateAllocation, or the
+// original conn otherwise.
+func (c *Client) activeConn() net.PacketConn {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	if c.migratedConn != nil {
+		return c.migratedConn
+	}
+
+	return c.conn
 }
 
 // Listen will have this client start listening on the conn provided via the config.
@@ -288,29 +319,38 @@ func (c *Client) Listen() error {
 	if err := c.listenTryLock.Lock(); err != nil {
 		return fmt.Errorf("%w: %s", errAlreadyListening, err.Error())
 	}
+	c.listenDesired.Store(true)
 
-	go func() {
-		buf := make([]byte, maxDataBufferSize)
-		for {
-			n, from, err := c.conn.ReadFrom(buf)
-			if err != nil {
-				c.log.Debugf("Failed to read: %s. Exiting loop", err)
-
-				break
-			}
-
-			_, err = c.HandleInbound(buf[:n], from)
-			if err != nil {
-				c.log.Debugf("Failed to handle inbound message: %s. Exiting loop", err)
-
-				break
-			}
-		}
-
-		c.listenTryLock.Unlock()
-	}()
+	go c.listenLoop()
 
 	return nil
+}
+
+func (c *Client) listenLoop() {
+	defer c.listenTryLock.Unlock()
+
+	buf := make([]byte, maxDataBufferSize)
+	for {
+		conn := c.activeConn()
+		n, from, err := conn.ReadFrom(buf)
+		if err != nil {
+			if c.activeConn() != conn {
+				// The client migrated to a new connection (RFC 8016);
+				// keep listening on the new socket.
+				continue
+			}
+			c.log.Debugf("Failed to read: %s. Exiting loop", err)
+
+			break
+		}
+
+		_, err = c.HandleInbound(buf[:n], from)
+		if err != nil {
+			c.log.Debugf("Failed to handle inbound message: %s. Exiting loop", err)
+
+			break
+		}
+	}
 }
 
 // Close closes this client.
@@ -365,12 +405,20 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Contex
 	lifetime proto.Lifetime,
 	nonce stun.Nonce,
 	reservationToken proto.ReservationToken,
+	mobilityTicket proto.MobilityTicket,
 	err error,
 ) {
 	allocationSetters := []stun.Setter{
 		stun.TransactionID,
 		stun.NewType(stun.MethodAllocate, stun.ClassRequest),
 		proto.RequestedTransport{Protocol: protocol},
+	}
+
+	// RFC 8016 Section 4.1: an empty MOBILITY-TICKET attribute tells the
+	// server that this client supports allocation mobility.
+	requestMobility := c.mobility && protocol == proto.ProtoUDP
+	if requestMobility {
+		allocationSetters = append(allocationSetters, proto.MobilityTicket{})
 	}
 
 	allocationSetters = appendRequestedAddressFamilyOrReservation(
@@ -385,22 +433,22 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Contex
 
 	msg, err := stun.Build(allocationSetters...)
 	if err != nil {
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 	}
 
 	trRes, err := c.PerformTransactionWithContext(msg, c.turnServerAddr, false, ctx)
 	if err != nil {
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 	}
 
 	res := trRes.Msg
 
 	// Anonymous allocate failed, trying to authenticate.
 	if err = nonce.GetFrom(res); err != nil {
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 	}
 	if err = c.realm.GetFrom(res); err != nil {
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 	}
 	c.realm = append([]byte(nil), c.realm...)
 	c.integrity = stun.NewLongTermIntegrity(
@@ -414,6 +462,10 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Contex
 		&c.username,
 		&c.realm,
 		&nonce,
+	}
+
+	if requestMobility {
+		allocationSetters = append(allocationSetters, proto.MobilityTicket{})
 	}
 
 	allocationSetters = appendRequestedAddressFamilyOrReservation(
@@ -433,12 +485,12 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Contex
 
 	msg, err = stun.Build(allocationSetters...)
 	if err != nil {
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 	}
 
 	trRes, err = c.PerformTransactionWithContext(msg, c.turnServerAddr, false, ctx)
 	if err != nil {
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 	}
 	res = trRes.Msg
 
@@ -450,15 +502,15 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Contex
 				ErrorCodeAttr:   code,
 			}
 
-			return relayed, mappedAddr, lifetime, nonce, reservationToken, turnError
+			return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, turnError
 		}
 
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, fmt.Errorf("%s", res.Type) //nolint:err113
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, fmt.Errorf("%s", res.Type) //nolint:err113
 	}
 
 	// Getting relayed addresses from response.
 	if err := relayed.GetFrom(res); err != nil {
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 	}
 
 	// Getting the mapped address from response. A response without one still makes a valid
@@ -468,22 +520,29 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Contex
 	case err == nil:
 		mappedAddr = &net.UDPAddr{IP: mapped.IP, Port: mapped.Port}
 	case !errors.Is(err, stun.ErrAttributeNotFound):
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 	}
 
 	// Getting lifetime from response
 	if err := lifetime.GetFrom(res); err != nil {
-		return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+		return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 	}
 
 	// Getting reservation-token from response
 	if c.evenPort {
 		if err := reservationToken.GetFrom(res); err != nil {
-			return relayed, mappedAddr, lifetime, nonce, reservationToken, err
+			return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err
 		}
 	}
 
-	return relayed, mappedAddr, lifetime, nonce, reservationToken, nil
+	// Getting the mobility ticket from response. Its absence means the
+	// server does not support (or did not enable) RFC 8016 mobility.
+	if requestMobility {
+		// A missing ticket is not an error: mobility simply stays disabled.
+		_ = mobilityTicket.GetFrom(res) //nolint:errcheck
+	}
+
+	return relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, nil
 }
 
 // AllocateWithContext sends a TURN allocation request to the given transport address.
@@ -501,7 +560,9 @@ func (c *Client) AllocateWithContext(ctx context.Context) (net.PacketConn, error
 		return nil, fmt.Errorf("%w: %s", errAlreadyAllocated, relayedConn.LocalAddr().String())
 	}
 
-	relayed, mappedAddr, lifetime, nonce, reservationToken, err := c.sendAllocateRequest(proto.ProtoUDP, ctx)
+	relayed, mappedAddr, lifetime, nonce, reservationToken, mobilityTicket, err := c.sendAllocateRequest(
+		proto.ProtoUDP, ctx,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -527,6 +588,7 @@ func (c *Client) AllocateWithContext(ctx context.Context) (net.PacketConn, error
 		PermissionRefreshInterval: c.permissionRefreshInterval,
 		BindingRefreshInterval:    c.bindingRefreshInterval,
 		BindingCheckInterval:      c.bindingCheckInterval,
+		MobilityTicket:            mobilityTicket,
 	})
 	c.setRelayedUDPConn(relayedConn)
 	c.setReservationToken(reservationToken)
@@ -537,6 +599,46 @@ func (c *Client) AllocateWithContext(ctx context.Context) (net.PacketConn, error
 // Allocate sends a TURN allocation request to the given transport address.
 func (c *Client) Allocate() (net.PacketConn, error) {
 	return c.AllocateWithContext(context.TODO())
+}
+
+// MigrateAllocation performs an RFC 8016 mobility handover of the client's
+// UDP allocation to newConn: it sends an authenticated Refresh request
+// carrying the current mobility ticket from the new 5-tuple and, on success,
+// switches the client's traffic (media, refreshes, retransmissions) to
+// newConn. The server keeps the existing allocation, permissions and channel
+// bindings, so media keeps flowing without a new Allocate.
+//
+// Mobility must have been negotiated (ClientConfig.Mobility and a server
+// that issues tickets), otherwise an error is returned. After a successful
+// migration the previous connection is no longer used by the client; closing
+// it (which the Listen loop tolerates) is left to the caller.
+func (c *Client) MigrateAllocation(newConn net.PacketConn) error {
+	if newConn == nil {
+		return errNilConn
+	}
+
+	relayedConn := c.relayedUDPConn()
+	if relayedConn == nil {
+		return errNoAllocation
+	}
+
+	if err := relayedConn.Migrate(newConn, c.rto); err != nil {
+		return err
+	}
+
+	c.mutex.Lock()
+	c.migratedConn = newConn
+	c.mutex.Unlock()
+
+	// If the listen loop already exited (e.g. the old network interface went
+	// down before the migration), restart it on the new connection.
+	if c.listenDesired.Load() {
+		if err := c.listenTryLock.Lock(); err == nil {
+			go c.listenLoop()
+		}
+	}
+
+	return nil
 }
 
 // AllocateTCPWithContext creates a new TCP allocation at the TURN server.
@@ -552,7 +654,7 @@ func (c *Client) AllocateTCPWithContext(ctx context.Context) (*client.TCPAllocat
 		return nil, fmt.Errorf("%w: %s", errAlreadyAllocated, allocation.Addr())
 	}
 
-	relayed, mappedAddr, lifetime, nonce, reservationToken, err := c.sendAllocateRequest(proto.ProtoTCP, ctx)
+	relayed, mappedAddr, lifetime, nonce, reservationToken, _, err := c.sendAllocateRequest(proto.ProtoTCP, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -639,7 +741,7 @@ func (c *Client) PerformTransactionWithContext(msg *stun.Message, to net.Addr, i
 	c.trMap.Insert(trKey, tr)
 
 	c.log.Tracef("Start %s transaction %s to %s", msg.Type, trKey, tr.To)
-	_, err := c.conn.WriteTo(tr.Raw, to)
+	_, err := c.activeConn().WriteTo(tr.Raw, to)
 	if err != nil {
 		c.removeTransaction(trKey)
 
@@ -900,7 +1002,7 @@ func (c *Client) onRtxTimeout(trKey string, nRtx int) {
 
 	c.log.Tracef("Retransmitting transaction %s to %s (nRtx=%d)",
 		trKey, tr.To, nRtx)
-	_, err := c.conn.WriteTo(tr.Raw, tr.To)
+	_, err := c.activeConn().WriteTo(tr.Raw, tr.To)
 	if err != nil {
 		c.trMap.Delete(trKey)
 		if !tr.WriteResult(client.TransactionResult{

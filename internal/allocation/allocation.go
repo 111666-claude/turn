@@ -36,6 +36,7 @@ type Allocation struct {
 	Protocol            Protocol
 	TurnSocket          net.PacketConn
 	fiveTuple           *FiveTuple
+	endpointLock        sync.RWMutex // guards fiveTuple and TurnSocket (RFC 8016 mobility)
 	permissionsLock     sync.RWMutex
 	permissions         map[string]*Permission
 	channelBindingsLock sync.RWMutex
@@ -80,6 +81,36 @@ func NewAllocation(
 	}
 }
 
+// FiveTuple returns the current 5-tuple of the allocation. It may change
+// over the allocation's lifetime when RFC 8016 mobility is in use.
+func (a *Allocation) FiveTuple() *FiveTuple {
+	a.endpointLock.RLock()
+	defer a.endpointLock.RUnlock()
+
+	return a.fiveTuple
+}
+
+// turnSocket returns the socket currently used to reach the client.
+func (a *Allocation) turnSocket() net.PacketConn {
+	a.endpointLock.RLock()
+	defer a.endpointLock.RUnlock()
+
+	return a.TurnSocket
+}
+
+// setEndpoint atomically moves the allocation to a new 5-tuple and turn socket.
+// Lock ordering: the Manager lock may be held when calling this method, but the
+// endpoint lock must never be held while taking the Manager lock.
+func (a *Allocation) setEndpoint(fiveTuple *FiveTuple, turnSocket net.PacketConn) {
+	a.endpointLock.Lock()
+	defer a.endpointLock.Unlock()
+
+	a.fiveTuple = fiveTuple
+	if turnSocket != nil {
+		a.TurnSocket = turnSocket
+	}
+}
+
 // GetPermission gets the Permission from the allocation.
 func (a *Allocation) GetPermission(addr net.Addr) *Permission {
 	a.permissionsLock.RLock()
@@ -108,8 +139,9 @@ func (a *Allocation) AddPermission(perms *Permission) {
 
 	if a.eventHandler.OnPermissionCreated != nil {
 		if u, ok := perms.Addr.(*net.UDPAddr); ok {
-			a.eventHandler.OnPermissionCreated(a.fiveTuple.SrcAddr, a.fiveTuple.DstAddr,
-				a.fiveTuple.Protocol.String(), a.userID, a.realm,
+			ft := a.FiveTuple()
+			a.eventHandler.OnPermissionCreated(ft.SrcAddr, ft.DstAddr,
+				ft.Protocol.String(), a.userID, a.realm,
 				a.RelayAddr, u.IP)
 		}
 	}
@@ -123,8 +155,9 @@ func (a *Allocation) RemovePermission(addr net.Addr) {
 
 	if a.eventHandler.OnPermissionDeleted != nil {
 		if u, ok := addr.(*net.UDPAddr); ok {
-			a.eventHandler.OnPermissionDeleted(a.fiveTuple.SrcAddr, a.fiveTuple.DstAddr,
-				a.fiveTuple.Protocol.String(), a.userID, a.realm,
+			ft := a.FiveTuple()
+			a.eventHandler.OnPermissionDeleted(ft.SrcAddr, ft.DstAddr,
+				ft.Protocol.String(), a.userID, a.realm,
 				a.RelayAddr, u.IP)
 		}
 	}
@@ -173,8 +206,9 @@ func (a *Allocation) AddChannelBind(chanBind *ChannelBind, channelLifetime, perm
 		a.AddPermission(NewPermission(chanBind.Peer, a.log, permissionLifetime))
 
 		if a.eventHandler.OnChannelCreated != nil {
-			a.eventHandler.OnChannelCreated(a.fiveTuple.SrcAddr, a.fiveTuple.DstAddr,
-				a.fiveTuple.Protocol.String(), a.userID, a.realm,
+			ft := a.FiveTuple()
+			a.eventHandler.OnChannelCreated(ft.SrcAddr, ft.DstAddr,
+				ft.Protocol.String(), a.userID, a.realm,
 				a.RelayAddr, chanBind.Peer, uint16(chanBind.Number))
 		}
 	} else {
@@ -195,8 +229,9 @@ func (a *Allocation) RemoveChannelBind(number proto.ChannelNumber) bool {
 	for i := len(a.channelBindings) - 1; i >= 0; i-- {
 		if a.channelBindings[i].Number == number {
 			if a.eventHandler.OnChannelDeleted != nil {
-				a.eventHandler.OnChannelDeleted(a.fiveTuple.SrcAddr, a.fiveTuple.DstAddr,
-					a.fiveTuple.Protocol.String(), a.userID, a.realm,
+				ft := a.FiveTuple()
+				a.eventHandler.OnChannelDeleted(ft.SrcAddr, ft.DstAddr,
+					ft.Protocol.String(), a.userID, a.realm,
 					a.RelayAddr, a.channelBindings[i].Peer, uint16(a.channelBindings[i].Number))
 			}
 
@@ -248,7 +283,7 @@ func (a *Allocation) ListChannelBindings() []*ChannelBind {
 // Refresh updates the allocations lifetime.
 func (a *Allocation) Refresh(lifetime time.Duration) {
 	if !a.lifetimeTimer.Reset(lifetime) {
-		a.log.Errorf("Failed to reset allocation timer for %v", a.fiveTuple)
+		a.log.Errorf("Failed to reset allocation timer for %v", a.FiveTuple())
 	}
 }
 
@@ -280,13 +315,13 @@ func (a *Allocation) removeTCPConnection(connectionID proto.ConnectionID) {
 
 		if err := conn.SetDeadline(time.Now()); err != nil && !errors.Is(err, net.ErrClosed) {
 			a.log.Errorf("Failed to set deadline on TCP Connection %s %v",
-				a.fiveTuple,
+				a.FiveTuple(),
 				err)
 		}
 
 		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			a.log.Errorf("Failed to close TCP Socket for %s %v",
-				a.fiveTuple,
+				a.FiveTuple(),
 				err)
 		}
 	}
@@ -375,7 +410,7 @@ func (a *Allocation) packetConnHandler(manager *Manager) {
 	for {
 		n, srcAddr, err := a.relayPacketConn.ReadFrom(buffer)
 		if err != nil {
-			manager.DeleteAllocation(a.fiveTuple)
+			manager.DeleteAllocation(a.FiveTuple())
 
 			return
 		}
@@ -385,6 +420,7 @@ func (a *Allocation) packetConnHandler(manager *Manager) {
 			n,
 			srcAddr)
 
+		fiveTuple := a.FiveTuple()
 		if channel := a.GetChannelByAddr(srcAddr); channel != nil { // nolint:nestif
 			channelData := &proto.ChannelData{
 				Data:   buffer[:n],
@@ -392,7 +428,7 @@ func (a *Allocation) packetConnHandler(manager *Manager) {
 			}
 			channelData.Encode()
 
-			if _, err = a.TurnSocket.WriteTo(channelData.Raw, a.fiveTuple.SrcAddr); err != nil {
+			if _, err = a.turnSocket().WriteTo(channelData.Raw, fiveTuple.SrcAddr); err != nil {
 				a.log.Errorf("Failed to send ChannelData from allocation %v %v", srcAddr, err)
 			}
 		} else if p := a.GetPermission(srcAddr); p != nil {
@@ -419,8 +455,8 @@ func (a *Allocation) packetConnHandler(manager *Manager) {
 			}
 			a.log.Debugf("Relaying message from %s to client at %s",
 				srcAddr,
-				a.fiveTuple.SrcAddr)
-			if _, err = a.TurnSocket.WriteTo(msg.Raw, a.fiveTuple.SrcAddr); err != nil {
+				fiveTuple.SrcAddr)
+			if _, err = a.turnSocket().WriteTo(msg.Raw, fiveTuple.SrcAddr); err != nil {
 				a.log.Errorf("Failed to send DataIndication from allocation %v %v", srcAddr, err)
 			}
 		} else {
@@ -433,15 +469,16 @@ func (a *Allocation) connHandler(manager *Manager) {
 	for {
 		conn, err := a.relayListener.Accept()
 		if err != nil {
-			manager.DeleteAllocation(a.fiveTuple)
+			manager.DeleteAllocation(a.FiveTuple())
 
 			return
 		}
 
+		fiveTuple := a.FiveTuple()
 		tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr)
 		if !ok {
 			_ = conn.Close()
-			a.log.Errorf("Failed to accept TCP Connection for Allocation %v %v", a.fiveTuple.SrcAddr, err)
+			a.log.Errorf("Failed to accept TCP Connection for Allocation %v %v", fiveTuple.SrcAddr, err)
 
 			continue
 		}
@@ -457,7 +494,7 @@ func (a *Allocation) connHandler(manager *Manager) {
 
 		cid, err := manager.addTCPConnection(a, conn)
 		if err != nil {
-			a.log.Errorf("Failed to create inbound TCP Connection for Allocation %v %v", a.fiveTuple.SrcAddr, err)
+			a.log.Errorf("Failed to create inbound TCP Connection for Allocation %v %v", fiveTuple.SrcAddr, err)
 
 			_ = conn.Close()
 
@@ -471,15 +508,15 @@ func (a *Allocation) connHandler(manager *Manager) {
 			cid,
 		)
 		if err != nil {
-			a.log.Errorf("Failed to ConnectionAttempt for Allocation %v %v", a.fiveTuple.SrcAddr, err)
+			a.log.Errorf("Failed to ConnectionAttempt for Allocation %v %v", fiveTuple.SrcAddr, err)
 
 			a.RemoveTCPConnection(manager, cid)
 
 			continue
 		}
 
-		if _, err = a.TurnSocket.WriteTo(msg.Raw, a.fiveTuple.SrcAddr); err != nil {
-			a.log.Errorf("Failed to send ConnectionAttempt for Allocation %v %v", a.fiveTuple.SrcAddr, err)
+		if _, err = a.turnSocket().WriteTo(msg.Raw, fiveTuple.SrcAddr); err != nil {
+			a.log.Errorf("Failed to send ConnectionAttempt for Allocation %v %v", fiveTuple.SrcAddr, err)
 
 			a.RemoveTCPConnection(manager, cid)
 		}

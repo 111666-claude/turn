@@ -54,6 +54,7 @@ func FuzzSetters(f *testing.F) {
 			{new(RequestedTransport), stun.AttrRequestedTransport},
 			{new(DontFragment), stun.AttrDontFragment},
 			{new(ReservationToken), stun.AttrReservationToken},
+		{new(MobilityTicket), AttrMobilityTicket},
 			{new(ConnectionID), stun.AttrConnectionID},
 			{new(RequestedAddressFamily), stun.AttrRequestedAddressFamily},
 		}

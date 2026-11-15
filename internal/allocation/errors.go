@@ -33,4 +33,13 @@ var (
 	errFailedToGenerateConnectionID = errors.New("failed to generate a unique connection id")
 	errInvalidPeerAddress           = errors.New("invalid peer address")
 	errNilRelaySocket               = errors.New("allocation has no relay socket")
+
+	// ErrInvalidMobilityTicket is returned when a mobility ticket is unknown, expired,
+	// already consumed by a different 5-tuple, or belongs to another user. A single
+	// generic error is used for all of these cases so that a rejected ticket does not
+	// reveal anything about other allocations' relay state.
+	ErrInvalidMobilityTicket = errors.New("invalid mobility ticket")
+
+	errMobilityDisabled = errors.New("allocation mobility is not enabled")
+	errFiveTupleInUse   = errors.New("mobility target 5-tuple is already in use by another allocation")
 )

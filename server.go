@@ -28,10 +28,11 @@ type Server struct {
 	authHandler         AuthHandler
 	quotaHandler        QuotaHandler
 	realm               string
-	channelBindTimeout  time.Duration
-	permissionTimeout   time.Duration
-	allocationLifetime  time.Duration
-	strictAddressFamily bool
+	channelBindTimeout     time.Duration
+	permissionTimeout      time.Duration
+	allocationLifetime     time.Duration
+	mobilityTicketLifetime time.Duration
+	strictAddressFamily    bool
 	nonceHash           server.NonceManager
 	eventHandler        EventHandler
 
@@ -63,19 +64,20 @@ func NewServer(config ServerConfig) (*Server, error) { //nolint:gocognit,cyclop
 	}
 
 	server := &Server{
-		log:                 loggerFactory.NewLogger("turn"),
-		authHandler:         config.AuthHandler,
-		quotaHandler:        config.QuotaHandler,
-		realm:               config.Realm,
-		channelBindTimeout:  config.ChannelBindTimeout,
-		permissionTimeout:   config.PermissionTimeout,
-		allocationLifetime:  config.AllocationLifetime,
-		strictAddressFamily: config.StrictAddressFamily,
-		packetConnConfigs:   config.PacketConnConfigs,
-		listenerConfigs:     config.ListenerConfigs,
-		nonceHash:           nonceHash,
-		inboundMTU:          mtu,
-		eventHandler:        config.EventHandler,
+		log:                    loggerFactory.NewLogger("turn"),
+		authHandler:            config.AuthHandler,
+		quotaHandler:           config.QuotaHandler,
+		realm:                  config.Realm,
+		channelBindTimeout:     config.ChannelBindTimeout,
+		permissionTimeout:      config.PermissionTimeout,
+		allocationLifetime:     config.AllocationLifetime,
+		mobilityTicketLifetime: config.MobilityTicketLifetime,
+		strictAddressFamily:    config.StrictAddressFamily,
+		packetConnConfigs:      config.PacketConnConfigs,
+		listenerConfigs:        config.ListenerConfigs,
+		nonceHash:              nonceHash,
+		inboundMTU:             mtu,
+		eventHandler:           config.EventHandler,
 	}
 
 	if server.channelBindTimeout == 0 {
@@ -234,12 +236,13 @@ func (s *Server) createAllocationManager(
 	}
 
 	am, err := allocation.NewManager(allocation.ManagerConfig{
-		AllocatePacketConn: addrGenerator.AllocatePacketConn,
-		AllocateListener:   addrGenerator.AllocateListener,
-		AllocateConn:       addrGenerator.AllocateConn,
-		PermissionHandler:  handler,
-		EventHandler:       s.eventHandler,
-		LeveledLogger:      s.log,
+		AllocatePacketConn:     addrGenerator.AllocatePacketConn,
+		AllocateListener:       addrGenerator.AllocateListener,
+		AllocateConn:           addrGenerator.AllocateConn,
+		PermissionHandler:      handler,
+		EventHandler:           s.eventHandler,
+		LeveledLogger:          s.log,
+		MobilityTicketLifetime: s.mobilityTicketLifetime,
 	})
 	if err != nil {
 		return am, err

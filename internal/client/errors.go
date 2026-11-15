@@ -23,6 +23,10 @@ var (
 	errCannotBindChannel                   = errors.New("cannot bind channel")
 	errChannelBindBadRequest               = errors.New("channel bind bad request")
 	errChannelBindTransactionFailed        = errors.New("channel bind transaction failed")
+	errMobilityNotNegotiated               = errors.New("allocation mobility was not negotiated with the server")
+	errMobilityRefreshTimeout              = errors.New("mobility refresh transaction timed out")
+	errMobilityTicketMissing               = errors.New("mobility refresh success response carried no new mobility ticket")
+	errNilPacketConn                       = errors.New("packet conn cannot be nil")
 )
 
 type timeoutError struct {

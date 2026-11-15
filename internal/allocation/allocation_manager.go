@@ -70,6 +70,12 @@ type ManagerConfig struct {
 	PermissionHandler  func(sourceAddr net.Addr, peerIP net.IP) bool
 	EventHandler       EventHandler
 
+	// MobilityTicketLifetime enables RFC 8016 allocation mobility when
+	// greater than zero and sets how long an issued mobility ticket remains
+	// valid. Zero (the default) disables mobility and preserves the
+	// pre-mobility behavior.
+	MobilityTicketLifetime time.Duration
+
 	tcpConnectionBindTimeout time.Duration
 }
 
@@ -83,9 +89,11 @@ type Manager struct {
 	lock                     sync.RWMutex
 	log                      logging.LeveledLogger
 	tcpConnectionBindTimeout time.Duration
+	mobilityTicketLifetime   time.Duration
 
-	allocations  map[FiveTupleFingerprint]*Allocation
-	reservations []*reservation
+	allocations     map[FiveTupleFingerprint]*Allocation
+	reservations    []*reservation
+	mobilityTickets map[string]*mobilityTicket
 
 	allocatePacketConn func(conf AllocateListenerConfig) (net.PacketConn, net.Addr, error)
 	allocateListener   func(conf AllocateListenerConfig) (net.Listener, net.Addr, error)
@@ -115,6 +123,8 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 	return &Manager{
 		log:                      config.LeveledLogger,
 		allocations:              make(map[FiveTupleFingerprint]*Allocation, 64),
+		mobilityTickets:          make(map[string]*mobilityTicket, 64),
+		mobilityTicketLifetime:   config.MobilityTicketLifetime,
 		allocatePacketConn:       config.AllocatePacketConn,
 		allocateListener:         config.AllocateListener,
 		allocateConn:             config.AllocateConn,
@@ -154,6 +164,8 @@ func (m *Manager) AllocationCount() int {
 func (m *Manager) Close() error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
+
+	m.mobilityTickets = make(map[string]*mobilityTicket, 64)
 
 	for _, a := range m.allocations {
 		if err := a.Close(); err != nil {
@@ -233,7 +245,7 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 	m.log.Debugf("Listening on relay address: %s", alloc.RelayAddr)
 
 	alloc.lifetimeTimer = time.AfterFunc(lifetime, func() {
-		m.DeleteAllocation(alloc.fiveTuple)
+		m.DeleteAllocation(alloc.FiveTuple())
 	})
 
 	m.lock.Lock()
@@ -264,6 +276,9 @@ func (m *Manager) DeleteAllocation(fiveTuple *FiveTuple) {
 	m.lock.Lock()
 	allocation := m.allocations[fingerprint]
 	delete(m.allocations, fingerprint)
+	if allocation != nil {
+		m.removeMobilityTicketsLocked(allocation)
+	}
 	m.lock.Unlock()
 
 	if allocation == nil {
