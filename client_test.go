@@ -8,6 +8,8 @@ package turn
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"runtime"
 	"sync/atomic"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/pion/logging"
 	"github.com/pion/stun/v3"
+	"github.com/pion/turn/v4/internal/client"
 	"github.com/pion/turn/v4/internal/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -533,6 +536,180 @@ func TestTCPClientAccept(t *testing.T) {
 	assert.NoError(t, allocation.Close())
 	assert.NoError(t, clientConn.Close())
 	assert.NoError(t, server.Close())
+}
+
+// startTCPRelayTestServer starts a TCP TURN server on an ephemeral port and
+// returns it together with the address clients should connect to.
+func startTCPRelayTestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+
+	const relayHost = "127.0.0.1"
+
+	tcpListener, err := net.Listen("tcp4", relayHost+":0") // nolint: noctx
+	require.NoError(t, err)
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(username, realm string, _ net.Addr) (key []byte, ok bool) {
+			return GenerateAuthKey(username, realm, "pass"), true
+		},
+		ListenerConfigs: []ListenerConfig{
+			{
+				Listener: tcpListener,
+				RelayAddressGenerator: &RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP(relayHost),
+					Address:      relayHost,
+				},
+			},
+		},
+		Realm: "pion.ly",
+	})
+	require.NoError(t, err)
+
+	return server, tcpListener.Addr().String()
+}
+
+// newTCPTestClient creates a TURN client connected over TCP and allocates a
+// TCP relay on it.
+func newTCPTestClient(t *testing.T, serverAddr string) (*Client, net.Conn, *client.TCPAllocation) {
+	t.Helper()
+
+	clientConn, err := net.Dial("tcp", serverAddr) // nolint: noctx
+	require.NoError(t, err)
+
+	turnClient, err := NewClient(&ClientConfig{
+		Conn:           NewSTUNConn(clientConn),
+		STUNServerAddr: serverAddr,
+		TURNServerAddr: serverAddr,
+		Username:       "foo",
+		Password:       "pass",
+		Realm:          "pion.ly",
+	})
+	require.NoError(t, err)
+	require.NoError(t, turnClient.Listen())
+
+	allocation, err := turnClient.AllocateTCP()
+	require.NoError(t, err)
+	require.NoError(t, turnClient.CreatePermission(&net.TCPAddr{IP: net.ParseIP("127.0.0.1")}))
+
+	return turnClient, clientConn, allocation
+}
+
+// TestTCPAllocationCloseReleasesPeerConnections reproduces the reported
+// scenario: a TCP allocation holds a batch of peer data connections. Closing
+// the allocation must release all of them (the first one included) and leave
+// other allocations relaying, consistently across many rounds.
+func TestTCPAllocationCloseReleasesPeerConnections(t *testing.T) {
+	const (
+		peerConnections = 32
+		rounds          = 50
+	)
+
+	for round := 0; round < rounds; round++ {
+		server, serverAddr := startTCPRelayTestServer(t)
+		firstClient, firstClientConn, firstAllocation := newTCPTestClient(t, serverAddr)
+
+		// A second allocation on the same server must survive the first
+		// allocation being closed.
+		secondClient, secondClientConn, secondAllocation := newTCPTestClient(t, serverAddr)
+
+		secondPeer, err := net.Dial("tcp4", secondAllocation.Addr().String()) // nolint: noctx
+		require.NoError(t, err, "round %d", round)
+
+		secondBoundConn, err := secondAllocation.Accept()
+		require.NoError(t, err, "round %d: bind other allocation", round)
+
+		// Build up peerConnections open data connections on the first
+		// allocation. Each peer is dialed and bound before the next one is
+		// dialed, so each Accept pairs with the peer just dialed and every
+		// connection stays open until the allocation is closed.
+		peers := make([]net.Conn, 0, peerConnections)
+		boundConns := make([]net.Conn, 0, peerConnections)
+		for i := 0; i < peerConnections; i++ {
+			peer, dialErr := net.Dial("tcp4", firstAllocation.Addr().String()) // nolint: noctx
+			require.NoError(t, dialErr, "round %d: peer %d", round, i)
+			peers = append(peers, peer)
+
+			conn, acceptErr := firstAllocation.Accept()
+			require.NoError(t, acceptErr, "round %d: bind %d", round, i)
+			boundConns = append(boundConns, conn)
+
+			// Set the deadline before the allocation is closed: Close
+			// releases the client-side data connections too, after which
+			// SetReadDeadline would fail instead of observing EOF.
+			require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)),
+				"round %d: data connection %d", round, i)
+
+			// Relay a payload end to end so the data connection is proven
+			// live before the allocation is closed.
+			payload := []byte{0xDD, byte(i)} // nolint:gosec
+			require.NoError(t, peer.SetReadDeadline(time.Now().Add(5*time.Second)),
+				"round %d: peer %d", round, i)
+			_, writeErr := peer.Write(payload)
+			require.NoError(t, writeErr, "round %d: peer %d write", round, i)
+
+			buf := make([]byte, len(payload))
+			_, readErr := io.ReadFull(conn, buf)
+			require.NoError(t, readErr, "round %d: data connection %d did not relay", round, i)
+			require.Equal(t, payload, buf, "round %d: data connection %d relayed wrong bytes", round, i)
+		}
+
+		// Close the allocation while all peer data connections are open.
+		require.NoError(t, firstAllocation.Close(), "round %d", round)
+
+		// The server must release the allocation and with it every peer
+		// data connection.
+		require.Eventually(t, func() bool {
+			return server.AllocationCount() == 1
+		}, 5*time.Second, time.Millisecond, "round %d: server kept the closed allocation", round)
+
+		// Every peer must observe the server-side socket closing.
+		for i, peer := range peers {
+			require.NoError(t, peer.SetReadDeadline(time.Now().Add(5*time.Second)),
+				"round %d: peer %d", round, i)
+
+			buf := make([]byte, 1)
+			_, readErr := peer.Read(buf)
+			require.ErrorIs(t, readErr, io.EOF,
+				"round %d: peer %d remained open after allocation close", round, i)
+
+			_ = peer.Close()
+		}
+
+		// The client-side data connections must be released as well. Close of
+		// the allocation closes them locally, so Read may see either EOF from
+		// the server or a locally-closed socket.
+		for i, conn := range boundConns {
+			buf := make([]byte, 1)
+			_, readErr := conn.Read(buf)
+			require.NotNil(t, readErr, "round %d: bound data connection %d stayed open", round, i)
+			require.True(t,
+				errors.Is(readErr, io.EOF) || errors.Is(readErr, net.ErrClosed),
+				"round %d: bound data connection %d failed unexpectedly: %v", round, i, readErr)
+
+			_ = conn.Close()
+		}
+
+		// The other allocation still relays data.
+		_, err = secondPeer.Write([]byte{0xBB})
+		require.NoError(t, err, "round %d: other allocation peer write", round)
+
+		require.NoError(t, secondBoundConn.SetReadDeadline(time.Now().Add(5*time.Second)),
+			"round %d", round)
+		buf := make([]byte, 1)
+		_, err = secondBoundConn.Read(buf)
+		require.NoError(t, err, "round %d: other allocation stopped relaying", round)
+		require.Equal(t, byte(0xBB), buf[0], "round %d: other allocation relayed wrong byte", round)
+
+		// Shutdown
+		_ = secondBoundConn.Close()
+		_ = secondPeer.Close()
+		require.NoError(t, secondAllocation.Close(), "round %d", round)
+		secondClient.Close()
+		require.NoError(t, secondClientConn.Close(), "round %d", round)
+		firstClient.Close()
+		require.NoError(t, firstClientConn.Close(), "round %d", round)
+		require.NoError(t, server.Close(), "round %d", round)
+	}
 }
 
 type channelBindFilterConn struct {

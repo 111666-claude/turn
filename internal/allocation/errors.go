@@ -25,4 +25,5 @@ var (
 	errFailedToGenerateConnectionID = errors.New("failed to generate a unique connection id")
 	errInvalidPeerAddress           = errors.New("invalid peer address")
 	errNilRelaySocket               = errors.New("allocation has no relay socket")
+	errAllocationClosed             = errors.New("allocation is closed")
 )

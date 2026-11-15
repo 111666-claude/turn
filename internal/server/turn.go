@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -537,7 +538,7 @@ func handleConnectRequest(req Request, stunMsg *stun.Message) error {
 	)...)
 }
 
-func handleConnectionBindRequest(req Request, stunMsg *stun.Message) error {
+func handleConnectionBindRequest(req Request, stunMsg *stun.Message) error { //nolint:cyclop
 	req.Log.Debugf("Received ConnectBind from %s", req.SrcAddr)
 	badRequestMsg := buildMsg(
 		stunMsg.TransactionID,
@@ -566,6 +567,10 @@ func handleConnectionBindRequest(req Request, stunMsg *stun.Message) error {
 
 	stunConn, ok := req.Conn.(*proto.STUNConn)
 	if !ok {
+		// GetTCPConnection has already claimed the connection and stopped
+		// its bind timer; release it so it cannot be left dangling.
+		req.AllocationManager.RemoveTCPConnection(connectionID)
+
 		return buildAndSendErr(req.Conn, req.SrcAddr, err, badRequestMsg...)
 	}
 
@@ -574,18 +579,50 @@ func handleConnectionBindRequest(req Request, stunMsg *stun.Message) error {
 		stun.NewType(stun.MethodConnect, stun.ClassSuccessResponse),
 		connectionID,
 	)...); err != nil {
+		// The client never learned that the bind succeeded, so nobody will
+		// relay or close this peer data connection.
+		req.AllocationManager.RemoveTCPConnection(connectionID)
+
 		return err
 	}
 
+	// Once the ConnectionBind succeeds the peer data connection and this
+	// client connection are used exclusively for user data. Relay bytes
+	// until either side stops, then close both and release the peer data
+	// connection so nothing is leaked if the allocation outlives it.
+	copyCompleteCtx, copyCompleteCancel := context.WithCancel(context.Background())
+	defer copyCompleteCancel()
+
 	go func() {
 		if _, ioErr := io.Copy(tcpConn, stunConn.Conn()); ioErr != nil {
-			req.Log.Debugf("Exit read loop on error: %s", err)
+			req.Log.Debugf("Exit peer->client read loop on error: %s", ioErr)
 		}
+		copyCompleteCancel()
 	}()
 
-	if _, err = io.Copy(stunConn.Conn(), tcpConn); err != nil {
-		req.Log.Debugf("Exit read loop on error: %s", err)
+	go func() {
+		if _, ioErr := io.Copy(stunConn.Conn(), tcpConn); ioErr != nil {
+			req.Log.Debugf("Exit client->peer read loop on error: %s", ioErr)
+		}
+		copyCompleteCancel()
+	}()
+
+	// When either side stops the with copy both sockets are closed, which
+	// unblocks the other copy.
+	<-copyCompleteCtx.Done()
+
+	if closeErr := tcpConn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		req.Log.Debugf("Failed to close peer data connection: %s", closeErr)
 	}
+
+	if closeErr := stunConn.Conn().Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		req.Log.Debugf("Failed to close client data connection: %s", closeErr)
+	}
+
+	// Drop the peer data connection from the allocation as well; without
+	// this a bound connection stays registered until the allocation is
+	// closed.
+	req.AllocationManager.RemoveTCPConnection(connectionID)
 
 	return nil
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/pion/turn/v4/internal/ipnet"
 	"github.com/pion/turn/v4/internal/proto"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGetPermission(t *testing.T) {
@@ -496,7 +497,7 @@ func TestAllocationConnHandler_AddTCPConnectionErrorClosesConn(t *testing.T) {
 	turnSocket := &mockTurnSocket{}
 	m, a := newTestAllocationForConnHandler(t, ln, turnSocket)
 
-	a.tcpConnections[proto.ConnectionID(1)] = existingConn
+	a.tcpConnections[proto.ConnectionID(1)] = &tcpConnection{Conn: existingConn}
 
 	a.connHandler(m)
 
@@ -536,4 +537,234 @@ func TestAllocationConnHandler_TurnSocketWriteErrorRemovesConnection(t *testing.
 	assert.True(t, conn.wasClosed())
 	assert.Empty(t, a.tcpConnections)
 	assert.Equal(t, 1, turnSocket.writeCount())
+}
+
+// newMockTCPConn returns a mock connection with the given peer address.
+func newMockTCPConn(port int) *mockConn {
+	return &mockConn{
+		remoteAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
+	}
+}
+
+// newTestTCPAllocation builds a Manager with a TCP allocation registered at
+// the given five-tuple. The relay listener is a mock, so no accept loop runs.
+func newTestTCPAllocation(t *testing.T, fiveTuple *FiveTuple) (*Manager, *Allocation) {
+	t.Helper()
+
+	log := logging.NewDefaultLoggerFactory().NewLogger("test")
+
+	a := NewAllocation(&mockTurnSocket{}, fiveTuple, EventHandler{}, log)
+	a.relayListener = &mockRelayListener{}
+	a.RelayAddr = a.relayListener.Addr()
+	a.lifetimeTimer = time.NewTimer(time.Hour)
+
+	m := &Manager{
+		log:                      log,
+		tcpConnectionBindTimeout: time.Hour,
+		allocations:              map[FiveTupleFingerprint]*Allocation{fiveTuple.Fingerprint(): a},
+	}
+
+	return m, a
+}
+
+func (a *Allocation) tcpConnectionCount() int {
+	a.tcpConnectionsLock.Lock()
+	defer a.tcpConnectionsLock.Unlock()
+
+	return len(a.tcpConnections)
+}
+
+func (a *Allocation) tcpConnection(id proto.ConnectionID) *tcpConnection {
+	a.tcpConnectionsLock.Lock()
+	defer a.tcpConnectionsLock.Unlock()
+
+	return a.tcpConnections[id]
+}
+
+// TestAllocationCloseReleasesAllTCPConnections reproduces the reported
+// scenario: a TCP allocation holds a batch of peer data connections. Closing
+// the allocation must release all of them (the first one included) and leave
+// other allocations untouched, consistently across repeated rounds.
+func TestAllocationCloseReleasesAllTCPConnections(t *testing.T) {
+	const (
+		peerConnections = 32
+		rounds          = 50
+	)
+
+	for round := 0; round < rounds; round++ {
+		fiveTuple := &FiveTuple{
+			Protocol: TCP,
+			SrcAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1000 + round},
+			DstAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 2222},
+		}
+		otherFiveTuple := &FiveTuple{
+			Protocol: TCP,
+			SrcAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 3), Port: 1000 + round},
+			DstAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 4), Port: 2222},
+		}
+
+		mgr, alloc := newTestTCPAllocation(t, fiveTuple)
+
+		// A second allocation with a peer connection of its own, to prove
+		// closing the first one does not touch it.
+		other := NewAllocation(&mockTurnSocket{}, otherFiveTuple, EventHandler{}, mgr.log)
+		other.relayListener = &mockRelayListener{}
+		other.RelayAddr = other.relayListener.Addr()
+		other.lifetimeTimer = time.NewTimer(time.Hour)
+		otherConn := newMockTCPConn(30000)
+		other.tcpConnections[proto.ConnectionID(999)] = &tcpConnection{Conn: otherConn}
+		mgr.allocations[otherFiveTuple.Fingerprint()] = other
+
+		conns := make([]*mockConn, 0, peerConnections)
+		for i := 0; i < peerConnections; i++ {
+			conn := newMockTCPConn(20000 + i)
+			conns = append(conns, conn)
+
+			_, err := mgr.addTCPConnection(alloc, conn)
+			require.NoError(t, err, "round %d: peer connection %d", round, i)
+		}
+
+		// Bind timeout is irrelevant for this test; stop the timers so they
+		// do not fire while the test holds connections.
+		alloc.tcpConnectionsLock.Lock()
+		for _, tcpConn := range alloc.tcpConnections {
+			if tcpConn.bindTimer != nil {
+				tcpConn.bindTimer.Stop()
+			}
+		}
+		alloc.tcpConnectionsLock.Unlock()
+
+		require.Equal(t, peerConnections, alloc.tcpConnectionCount(), "round %d", round)
+
+		// Closing through the manager is the path the server takes.
+		mgr.DeleteAllocation(fiveTuple)
+
+		for i, conn := range conns {
+			assert.True(t, conn.wasClosed(),
+				"round %d: peer connection %d remained open after allocation close", round, i)
+		}
+		assert.Equal(t, 0, alloc.tcpConnectionCount(), "round %d: connections remain registered", round)
+
+		// Repeated close must be a no-op and must not disturb other allocations.
+		require.NoError(t, alloc.Close(), "round %d: second close", round)
+		assert.Equal(t, 0, alloc.tcpConnectionCount(), "round %d: connections reappeared", round)
+		assert.False(t, otherConn.wasClosed(), "round %d: other allocation connection was closed", round)
+		assert.Equal(t, 1, mgr.AllocationCount(), "round %d: unrelated allocation was removed", round)
+
+		mgr.DeleteAllocation(otherFiveTuple)
+		assert.True(t, otherConn.wasClosed(), "round %d: other allocation connection leaked", round)
+		assert.Equal(t, 0, mgr.AllocationCount(), "round %d", round)
+	}
+}
+
+// TestAllocationCloseReleasesPendingBind makes sure a peer data connection
+// that a ConnectionBind has not claimed yet is closed when the allocation is
+// released, so a pending bind cannot keep it alive.
+func TestAllocationCloseReleasesPendingBind(t *testing.T) {
+	fiveTuple := &FiveTuple{
+		Protocol: TCP,
+		SrcAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1111},
+		DstAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 2222},
+	}
+
+	conn := newMockTCPConn(1)
+	mgr, alloc := newTestTCPAllocation(t, fiveTuple)
+
+	connectionID, err := mgr.addTCPConnection(alloc, conn)
+	require.NoError(t, err)
+
+	// Not bound yet: GetTCPConnection would hand it to a ConnectionBind.
+	tcpConn := alloc.tcpConnection(connectionID)
+	require.NotNil(t, tcpConn)
+	require.False(t, tcpConn.isBound.Load())
+
+	require.NoError(t, alloc.Close())
+
+	assert.True(t, conn.wasClosed(), "peer connection with a pending bind was not released")
+	assert.Nil(t, mgr.GetTCPConnection("", connectionID), "released connection is still bindable")
+}
+
+// TestAllocationCloseIsIdempotentAndConcurrencySafe exercises Close against
+// concurrent RemoveTCPConnection calls: no connection may survive and Close
+// must stay a no-op when repeated.
+func TestAllocationCloseIsIdempotentAndConcurrencySafe(t *testing.T) {
+	const peerConnections = 32
+
+	for round := 0; round < 50; round++ {
+		fiveTuple := &FiveTuple{
+			Protocol: TCP,
+			SrcAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 5000 + round},
+			DstAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 2222},
+		}
+
+		mgr, alloc := newTestTCPAllocation(t, fiveTuple)
+
+		conns := make([]*mockConn, 0, peerConnections)
+		ids := make([]proto.ConnectionID, 0, peerConnections)
+		for i := 0; i < peerConnections; i++ {
+			conn := newMockTCPConn(40000 + i)
+			conns = append(conns, conn)
+
+			connectionID, err := mgr.addTCPConnection(alloc, conn)
+			require.NoError(t, err)
+			ids = append(ids, connectionID)
+		}
+
+		var wg sync.WaitGroup
+		for _, id := range ids {
+			wg.Add(1)
+			go func(id proto.ConnectionID) {
+				defer wg.Done()
+
+				alloc.RemoveTCPConnection(id)
+			}(id)
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			_ = alloc.Close()
+		}()
+
+		wg.Wait()
+
+		for i, conn := range conns {
+			assert.True(t, conn.wasClosed(), "round %d: connection %d leaked", round, i)
+		}
+		assert.Equal(t, 0, alloc.tcpConnectionCount(), "round %d", round)
+		require.NoError(t, alloc.Close(), "round %d: repeated close", round)
+	}
+}
+
+// TestTCPConnectionBindTimeoutClosesUnbound makes sure a peer data connection
+// that never receives a ConnectionBind is closed when the bind timer fires,
+// and that a connection which was bound is left alone.
+func TestTCPConnectionBindTimeoutClosesUnbound(t *testing.T) {
+	fiveTuple := &FiveTuple{
+		Protocol: TCP,
+		SrcAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1111},
+		DstAddr:  &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 2222},
+	}
+
+	mgr, alloc := newTestTCPAllocation(t, fiveTuple)
+	mgr.tcpConnectionBindTimeout = time.Millisecond
+
+	unbound := newMockTCPConn(1)
+	unboundID, err := mgr.addTCPConnection(alloc, unbound)
+	require.NoError(t, err)
+
+	bound := newMockTCPConn(2)
+	boundID, err := mgr.addTCPConnection(alloc, bound)
+	require.NoError(t, err)
+
+	require.NotNil(t, mgr.GetTCPConnection("", boundID))
+
+	require.Eventually(t, func() bool {
+		return unbound.wasClosed()
+	}, time.Second, time.Millisecond, "unbound connection was never closed")
+
+	assert.Nil(t, mgr.GetTCPConnection("", unboundID), "timed out connection is still bindable")
+	assert.False(t, bound.wasClosed(), "bound connection was closed by the bind timer")
+	assert.NotNil(t, alloc.tcpConnection(boundID), "bound connection was removed")
 }

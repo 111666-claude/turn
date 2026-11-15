@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/pion/stun/v3"
@@ -21,6 +22,8 @@ var (
 	_ transport.Dialer      = (*TCPAllocation)(nil)
 )
 
+const acceptOp = "accept"
+
 func noDeadline() time.Time {
 	return time.Time{}
 }
@@ -32,6 +35,12 @@ type TCPAllocation struct {
 	connAttemptCh chan *connectionAttempt
 	acceptTimer   *time.Timer
 	allocation
+
+	closeCh   chan struct{}         // Closed once when the allocation is released
+	closeOnce sync.Once             // Ensures the release work runs exactly once
+	connsLock sync.Mutex            // Guards closed and openConns
+	closed    bool                  // Guarded by connsLock
+	openConns map[*TCPConn]struct{} // Data connections opened via Dial/Accept
 }
 
 // NewTCPAllocation creates a new instance of TCPConn.
@@ -39,6 +48,8 @@ func NewTCPAllocation(config *AllocationConfig) *TCPAllocation {
 	alloc := &TCPAllocation{
 		connAttemptCh: make(chan *connectionAttempt, 10),
 		acceptTimer:   time.NewTimer(time.Duration(math.MaxInt64)),
+		closeCh:       make(chan struct{}),
+		openConns:     make(map[*TCPConn]struct{}),
 		allocation: allocation{
 			client:      config.Client,
 			relayedAddr: config.RelayedAddr,
@@ -221,6 +232,10 @@ func (a *TCPAllocation) DialTCPWithConn(conn net.Conn, _ string, rAddr *net.TCPA
 		return nil, fmt.Errorf("failed to bind connection: %w", err)
 	}
 
+	if err := a.trackConn(dataConn); err != nil {
+		return nil, err
+	}
+
 	return dataConn, nil
 }
 
@@ -335,15 +350,56 @@ func (a *TCPAllocation) AcceptTCPWithConn(conn net.Conn) (*TCPConn, error) {
 			return nil, fmt.Errorf("failed to bind connection: %w", err)
 		}
 
+		if err := a.trackConn(dataConn); err != nil {
+			return nil, err
+		}
+
 		return dataConn, nil
+	case <-a.closeCh:
+		return nil, &net.OpError{
+			Op:   acceptOp,
+			Net:  a.Addr().Network(),
+			Addr: a.Addr(),
+			Err:  errAlreadyClosed,
+		}
 	case <-a.acceptTimer.C:
 		return nil, &net.OpError{
-			Op:   "accept",
+			Op:   acceptOp,
 			Net:  a.Addr().Network(),
 			Addr: a.Addr(),
 			Err:  newTimeoutError("i/o timeout"),
 		}
 	}
+}
+
+// trackConn registers a data connection so Close can release it. If the
+// allocation has already been closed the connection is closed right away and
+// the caller is told the bind could not be kept.
+func (a *TCPAllocation) trackConn(conn *TCPConn) error {
+	a.connsLock.Lock()
+	if a.closed {
+		a.connsLock.Unlock()
+		conn.Close() //nolint:errcheck,gosec
+
+		return &net.OpError{
+			Op:   acceptOp,
+			Net:  a.Addr().Network(),
+			Addr: a.Addr(),
+			Err:  errAlreadyClosed,
+		}
+	}
+	a.openConns[conn] = struct{}{}
+	a.connsLock.Unlock()
+
+	return nil
+}
+
+// untrackConn stops tracking a data connection.
+func (a *TCPAllocation) untrackConn(conn *TCPConn) {
+	a.connsLock.Lock()
+	defer a.connsLock.Unlock()
+
+	delete(a.openConns, conn)
 }
 
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
@@ -363,10 +419,49 @@ func (a *TCPAllocation) SetDeadline(t time.Time) error {
 // Any blocked Accept operations will be unblocked and return errors.
 // Any opened connection via Dial/Accept will be closed.
 func (a *TCPAllocation) Close() error {
-	a.refreshAllocTimer.Stop()
-	a.refreshPermsTimer.Stop()
+	first := false
+	a.closeOnce.Do(func() {
+		first = true
 
-	a.client.OnDeallocated(a.relayedAddr)
+		close(a.closeCh)
+
+		a.refreshAllocTimer.Stop()
+		a.refreshPermsTimer.Stop()
+		a.acceptTimer.Stop()
+
+		// Mark the allocation closed under the lock so a concurrent
+		// trackConn either lands in openConns before the sweep below or
+		// closes its own connection.
+		a.connsLock.Lock()
+		a.closed = true
+		conns := make([]*TCPConn, 0, len(a.openConns))
+		for conn := range a.openConns {
+			conns = append(conns, conn)
+		}
+		a.connsLock.Unlock()
+
+		// TCPConn.Close unregisters itself, so close without the lock.
+		for _, conn := range conns {
+			conn.Close() //nolint:errcheck,gosec
+		}
+
+		// Drop any ConnectionAttempt indications that were never accepted;
+		// their peer data connections are released with the allocation by
+		// the server.
+		for {
+			select {
+			case <-a.connAttemptCh:
+			default:
+				a.client.OnDeallocated(a.relayedAddr)
+
+				return
+			}
+		}
+	})
+
+	if !first {
+		return nil
+	}
 
 	return a.refreshAllocation(0, true /* dontWait=true */)
 }
@@ -379,8 +474,11 @@ func (a *TCPAllocation) Addr() net.Addr {
 // HandleConnectionAttempt is called by the TURN client
 // when it receives a ConnectionAttempt indication.
 func (a *TCPAllocation) HandleConnectionAttempt(from *net.TCPAddr, cid proto.ConnectionID) {
-	a.connAttemptCh <- &connectionAttempt{
+	select {
+	case a.connAttemptCh <- &connectionAttempt{
 		from: from,
 		cid:  cid,
+	}:
+	case <-a.closeCh:
 	}
 }

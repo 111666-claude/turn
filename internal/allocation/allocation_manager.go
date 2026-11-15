@@ -14,6 +14,11 @@ import (
 	"github.com/pion/turn/v4/internal/proto"
 )
 
+// If no ConnectionBind request associated with a peer data connection is
+// received within this duration, the peer data connection MUST be closed.
+// See: https://datatracker.ietf.org/doc/html/rfc6062#section-5.4
+const defaultTCPConnectionBindTimeout = 30 * time.Second
+
 // ManagerConfig a bag of config params for Manager.
 type ManagerConfig struct {
 	LeveledLogger      logging.LeveledLogger
@@ -21,6 +26,8 @@ type ManagerConfig struct {
 	AllocateListener   func(network string, requestedPort int) (net.Listener, net.Addr, error)
 	PermissionHandler  func(sourceAddr net.Addr, peerIP net.IP) bool
 	EventHandler       EventHandler
+
+	tcpConnectionBindTimeout time.Duration
 }
 
 type reservation struct {
@@ -30,8 +37,9 @@ type reservation struct {
 
 // Manager is used to hold active allocations.
 type Manager struct {
-	lock sync.RWMutex
-	log  logging.LeveledLogger
+	lock                     sync.RWMutex
+	log                      logging.LeveledLogger
+	tcpConnectionBindTimeout time.Duration
 
 	allocations  map[FiveTupleFingerprint]*Allocation
 	reservations []*reservation
@@ -53,13 +61,19 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		return nil, errLeveledLoggerMustBeSet
 	}
 
+	tcpConnectionBindTimeout := config.tcpConnectionBindTimeout
+	if tcpConnectionBindTimeout == 0 {
+		tcpConnectionBindTimeout = defaultTCPConnectionBindTimeout
+	}
+
 	return &Manager{
-		log:                config.LeveledLogger,
-		allocations:        make(map[FiveTupleFingerprint]*Allocation, 64),
-		allocatePacketConn: config.AllocatePacketConn,
-		allocateListener:   config.AllocateListener,
-		permissionHandler:  config.PermissionHandler,
-		EventHandler:       config.EventHandler,
+		log:                      config.LeveledLogger,
+		allocations:              make(map[FiveTupleFingerprint]*Allocation, 64),
+		allocatePacketConn:       config.AllocatePacketConn,
+		allocateListener:         config.AllocateListener,
+		permissionHandler:        config.PermissionHandler,
+		EventHandler:             config.EventHandler,
+		tcpConnectionBindTimeout: tcpConnectionBindTimeout,
 	}, nil
 }
 
@@ -153,7 +167,7 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 	m.log.Debugf("Listening on relay address: %s", alloc.RelayAddr)
 
 	alloc.lifetimeTimer = time.AfterFunc(lifetime, func() {
-		m.DeleteAllocation(alloc.fiveTuple)
+		m.deleteAllocation(alloc.fiveTuple, alloc)
 	})
 
 	m.lock.Lock()
@@ -179,16 +193,25 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 
 // DeleteAllocation removes an allocation.
 func (m *Manager) DeleteAllocation(fiveTuple *FiveTuple) {
+	m.deleteAllocation(fiveTuple, nil)
+}
+
+// deleteAllocation removes an allocation. When expected is non-nil the
+// allocation is only removed if it is still the one registered for the
+// five-tuple. This keeps a lifetime timer or relay loop belonging to an
+// allocation that has already been replaced from tearing down its successor.
+func (m *Manager) deleteAllocation(fiveTuple *FiveTuple, expected *Allocation) {
 	fingerprint := fiveTuple.Fingerprint()
 
 	m.lock.Lock()
 	allocation := m.allocations[fingerprint]
-	delete(m.allocations, fingerprint)
-	m.lock.Unlock()
+	if allocation == nil || (expected != nil && allocation != expected) {
+		m.lock.Unlock()
 
-	if allocation == nil {
 		return
 	}
+	delete(m.allocations, fingerprint)
+	m.lock.Unlock()
 
 	if err := allocation.Close(); err != nil {
 		m.log.Errorf("Failed to close allocation: %v", err)
@@ -302,7 +325,7 @@ func (m *Manager) CreateTCPConnection( // nolint: cyclop
 	return connectionID, err
 }
 
-func (m *Manager) addTCPConnection(allocation *Allocation, conn net.Conn) (proto.ConnectionID, error) {
+func (m *Manager) addTCPConnection(allocation *Allocation, conn net.Conn) (proto.ConnectionID, error) { //nolint:cyclop
 	rand64, err := randutil.CryptoUint64()
 	if err != nil {
 		return 0, err
@@ -310,22 +333,40 @@ func (m *Manager) addTCPConnection(allocation *Allocation, conn net.Conn) (proto
 
 	connectionID := proto.ConnectionID(uint32(rand64 >> 32)) // nolint: gosec
 
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	for _, a := range m.allocations {
-		if _, ok := a.tcpConnections[connectionID]; ok {
-			return 0, errFailedToGenerateConnectionID
-		}
-	}
-
 	newConnAddr, ok := conn.RemoteAddr().(*net.TCPAddr)
 	if !ok {
 		return 0, ErrDupeTCPConnection
 	}
 
-	for i := range allocation.tcpConnections {
-		tcpAddr, ok := allocation.tcpConnections[i].RemoteAddr().(*net.TCPAddr)
+	// The manager lock is held until the connection has been inserted so
+	// ConnectionIDs stay globally unique across allocations. The allocation
+	// lock is taken inside it; lock order is always manager then allocation.
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	for _, a := range m.allocations {
+		a.tcpConnectionsLock.Lock()
+		_, exists := a.tcpConnections[connectionID]
+		a.tcpConnectionsLock.Unlock()
+
+		if exists {
+			return 0, errFailedToGenerateConnectionID
+		}
+	}
+
+	allocation.tcpConnectionsLock.Lock()
+	defer allocation.tcpConnectionsLock.Unlock()
+
+	// The allocation may have been closed between the call that produced
+	// conn and this point (for example an inbound connection accepted while
+	// a Refresh with lifetime 0 tears the allocation down). Refuse to add a
+	// connection that would never be closed.
+	if allocation.closed.Load() {
+		return 0, errAllocationClosed
+	}
+
+	for _, tcpConn := range allocation.tcpConnections {
+		tcpAddr, ok := tcpConn.RemoteAddr().(*net.TCPAddr)
 		if !ok {
 			return 0, ErrDupeTCPConnection
 		} else if tcpAddr.IP.Equal(newConnAddr.IP) && tcpAddr.Port == newConnAddr.Port {
@@ -333,21 +374,65 @@ func (m *Manager) addTCPConnection(allocation *Allocation, conn net.Conn) (proto
 		}
 	}
 
-	allocation.tcpConnections[connectionID] = conn
+	tcpConn := &tcpConnection{Conn: conn}
+	allocation.tcpConnections[connectionID] = tcpConn
+
+	bindTimeout := m.tcpConnectionBindTimeout
+	if bindTimeout == 0 {
+		bindTimeout = defaultTCPConnectionBindTimeout
+	}
+	tcpConn.bindTimer = time.AfterFunc(bindTimeout, func() {
+		if allocation.removeTCPConnectionIfUnbound(connectionID) {
+			m.log.Warnf("Removed TCP Connection that was never bound %v %v", connectionID, allocation.fiveTuple)
+		}
+	})
 
 	return connectionID, nil
 }
 
 // GetTCPConnection returns the TCP Connection for the given ConnectionID.
+//
+// A connection can only be bound once. A connection that is already bound or
+// that belongs to another user is not returned.
 func (m *Manager) GetTCPConnection(username string, connectionID proto.ConnectionID) net.Conn {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
+	m.lock.RLock()
+	allocations := make([]*Allocation, 0, len(m.allocations))
 	for _, a := range m.allocations {
-		if _, ok := a.tcpConnections[connectionID]; ok && a.username == username {
-			return a.tcpConnections[connectionID]
+		allocations = append(allocations, a)
+	}
+	m.lock.RUnlock()
+
+	for _, a := range allocations {
+		a.tcpConnectionsLock.Lock()
+		tcpConn, ok := a.tcpConnections[connectionID]
+		if !ok || a.username != username || tcpConn.isBound.Swap(true) {
+			a.tcpConnectionsLock.Unlock()
+
+			continue
 		}
+
+		if tcpConn.bindTimer != nil {
+			tcpConn.bindTimer.Stop()
+		}
+		a.tcpConnectionsLock.Unlock()
+
+		return tcpConn
 	}
 
 	return nil
+}
+
+// RemoveTCPConnection closes and removes the TCP Connection with the given
+// ConnectionID from whichever allocation owns it.
+func (m *Manager) RemoveTCPConnection(connectionID proto.ConnectionID) {
+	m.lock.RLock()
+	allocations := make([]*Allocation, 0, len(m.allocations))
+	for _, a := range m.allocations {
+		allocations = append(allocations, a)
+	}
+	m.lock.RUnlock()
+
+	for _, a := range allocations {
+		a.RemoveTCPConnection(connectionID)
+	}
 }

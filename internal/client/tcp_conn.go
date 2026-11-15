@@ -36,6 +36,15 @@ type connectionAttempt struct {
 	cid  proto.ConnectionID
 }
 
+// Close closes the connection and stops the allocation from tracking it.
+func (c *TCPConn) Close() error {
+	if c.allocation != nil {
+		c.allocation.untrackConn(c)
+	}
+
+	return c.TCPConn.Close()
+}
+
 // LocalAddr returns the local network address.
 // The Addr returned is shared by all invocations of LocalAddr, so do not modify it.
 func (c *TCPConn) LocalAddr() net.Addr {
